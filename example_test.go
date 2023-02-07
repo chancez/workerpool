@@ -32,7 +32,7 @@ func Example() {
 		id := fmt.Sprintf("task #%d", i)
 		// Use Submit to submit tasks for processing. Submit blocks when no
 		// worker is available to pick up the task.
-		err := wp.Submit(id, func(_ context.Context) error {
+		err := wp.Submit(context.Background(), id, func(_ context.Context) error {
 			fmt.Println("isprime", n)
 			if IsPrime(n) {
 				fmt.Println(n, "is prime!")
@@ -49,7 +49,7 @@ func Example() {
 
 	// Drain prevents submitting new tasks and blocks until all submitted tasks
 	// complete.
-	tasks, err := wp.Drain()
+	tasks, err := wp.Drain(context.Background())
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		return
@@ -64,7 +64,7 @@ func Example() {
 	}
 
 	// Close should be called once the worker pool is no longer necessary.
-	if err := wp.Close(); err != nil {
+	if err := wp.Close(context.Background()); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 	}
 }

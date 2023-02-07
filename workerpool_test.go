@@ -32,7 +32,7 @@ func TestWorkerPoolNewPanics(t *testing.T) {
 
 func TestWorkerPoolTasksCapacity(t *testing.T) {
 	wp := workerpool.New(runtime.NumCPU())
-	defer wp.Close()
+	defer wp.Close(context.Background())
 
 	if c := wp.TasksCap(); c != 0 {
 		t.Errorf("tasks channel capacity is %d; want 0 (an unbuffered channel)", c)
@@ -41,20 +41,20 @@ func TestWorkerPoolTasksCapacity(t *testing.T) {
 
 func TestWorkerPoolCap(t *testing.T) {
 	one := workerpool.New(1)
-	defer one.Close()
+	defer one.Close(context.Background())
 	if c := one.Cap(); c != 1 {
 		t.Errorf("got %d; want %d", c, 1)
 	}
 
 	n := runtime.NumCPU()
 	ncpu := workerpool.New(n)
-	defer ncpu.Close()
+	defer ncpu.Close(context.Background())
 	if c := ncpu.Cap(); c != n {
 		t.Errorf("got %d; want %d", c, n)
 	}
 
 	fortyTwo := workerpool.New(42)
-	defer fortyTwo.Close()
+	defer fortyTwo.Close(context.Background())
 	if c := fortyTwo.Cap(); c != 42 {
 		t.Errorf("got %d; want %d", c, 42)
 	}
@@ -62,13 +62,18 @@ func TestWorkerPoolCap(t *testing.T) {
 
 func TestWorkerPoolLen(t *testing.T) {
 	wp := workerpool.New(1)
-	defer wp.Close()
+	defer wp.Close(context.Background())
 	if l := wp.Len(); l != 0 {
 		t.Errorf("got %d; want %d", l, 0)
 	}
 
+	runErr := make(chan error)
+	go func() {
+		runErr <- wp.Run(context.Background())
+	}()
+
 	submitted := make(chan struct{})
-	err := wp.Submit("", func(ctx context.Context) error {
+	err := wp.Submit(context.Background(), "", func(ctx context.Context) error {
 		close(submitted)
 		<-ctx.Done()
 		return ctx.Err()
@@ -82,11 +87,14 @@ func TestWorkerPoolLen(t *testing.T) {
 		t.Errorf("got %d; want %d", l, 1)
 	}
 
-	if err := wp.Close(); err != nil {
+	if err := wp.Close(context.Background()); err != nil {
 		t.Fatalf("close: got '%v', want no error", err)
 	}
 	if l := wp.Len(); l != 0 {
 		t.Errorf("got %d; want %d", l, 0)
+	}
+	if err := <-runErr; err != nil {
+		t.Errorf("got run error: %s", err)
 	}
 }
 
@@ -97,7 +105,7 @@ func TestWorkerPoolConcurrentTasksCount(t *testing.T) {
 	n := runtime.NumCPU()
 	wp := workerpool.New(n)
 	defer func() {
-		if err := wp.Close(); err != nil {
+		if err := wp.Close(context.Background()); err != nil {
 			t.Fatalf("unexpected error %v", err)
 		}
 	}()
@@ -107,7 +115,7 @@ func TestWorkerPoolConcurrentTasksCount(t *testing.T) {
 	// NOTE: schedule one more task than we have workers, hence n+1.
 	for i := 0; i < n+1; i++ {
 		id := fmt.Sprintf("task #%2d", i)
-		err := wp.Submit(id, func(ctx context.Context) error {
+		err := wp.Submit(context.Background(), id, func(ctx context.Context) error {
 			select {
 			case working <- struct{}{}:
 			case <-ctx.Done():
@@ -151,7 +159,7 @@ func TestWorkerPool(t *testing.T) {
 	wg.Add(numTasks - 1)
 	for i := 0; i < numTasks-1; i++ {
 		id := fmt.Sprintf("task #%2d", i)
-		err := wp.Submit(id, func(_ context.Context) error {
+		err := wp.Submit(context.Background(), id, func(_ context.Context) error {
 			defer wg.Done()
 			working <- struct{}{}
 			done <- struct{}{}
@@ -174,7 +182,7 @@ func TestWorkerPool(t *testing.T) {
 	go func() {
 		id := fmt.Sprintf("task #%2d", numTasks-1)
 		ready <- struct{}{}
-		err := wp.Submit(id, func(_ context.Context) error {
+		err := wp.Submit(context.Background(), id, func(_ context.Context) error {
 			defer wg.Done()
 			done <- struct{}{}
 			return nil
@@ -196,7 +204,7 @@ func TestWorkerPool(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		ready <- struct{}{}
-		results, err := wp.Drain()
+		results, err := wp.Drain(context.Background())
 		if err != nil {
 			t.Errorf("draining failed: %v", err)
 		}
@@ -226,7 +234,7 @@ func TestWorkerPool(t *testing.T) {
 
 	wg.Wait()
 
-	if err := wp.Close(); err != nil {
+	if err := wp.Close(context.Background()); err != nil {
 		t.Errorf("close: got '%v', want no error", err)
 	}
 }
@@ -241,7 +249,7 @@ func TestConcurrentDrain(t *testing.T) {
 	wg.Add(numTasks)
 	for i := 0; i < numTasks; i++ {
 		id := fmt.Sprintf("task #%2d", i)
-		err := wp.Submit(id, func(_ context.Context) error {
+		err := wp.Submit(context.Background(), id, func(_ context.Context) error {
 			defer wg.Done()
 			done <- struct{}{}
 			return nil
@@ -256,7 +264,7 @@ func TestConcurrentDrain(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		ready <- struct{}{}
-		results, err := wp.Drain()
+		results, err := wp.Drain(context.Background())
 		if err != nil {
 			t.Errorf("draining failed: %v", err)
 		}
@@ -278,11 +286,11 @@ func TestConcurrentDrain(t *testing.T) {
 	<-ready
 	time.Sleep(10 * time.Millisecond)
 
-	if err := wp.Submit("", nil); !errors.Is(err, workerpool.ErrDraining) {
+	if err := wp.Submit(context.Background(), "", nil); !errors.Is(err, workerpool.ErrDraining) {
 		t.Errorf("submit: got '%v', want '%v'", err, workerpool.ErrDraining)
 	}
 
-	results, err := wp.Drain()
+	results, err := wp.Drain(context.Background())
 	if !errors.Is(err, workerpool.ErrDraining) {
 		t.Errorf("drain: got '%v', want '%v'", err, workerpool.ErrDraining)
 	}
@@ -297,7 +305,7 @@ func TestConcurrentDrain(t *testing.T) {
 
 	wg.Wait()
 
-	results, err = wp.Drain()
+	results, err = wp.Drain(context.Background())
 	if err != nil {
 		t.Errorf("drain: got '%v', want '%v'", err, nil)
 	}
@@ -305,15 +313,15 @@ func TestConcurrentDrain(t *testing.T) {
 		t.Errorf("drain: unexpectedly got '%d' results", len(results))
 	}
 
-	if err := wp.Close(); err != nil {
+	if err := wp.Close(context.Background()); err != nil {
 		t.Errorf("close: got '%v', want no error", err)
 	}
 }
 
 func TestWorkerPoolDrainAfterClose(t *testing.T) {
 	wp := workerpool.New(runtime.NumCPU())
-	wp.Close()
-	tasks, err := wp.Drain()
+	wp.Close(context.Background())
+	tasks, err := wp.Drain(context.Background())
 	if !errors.Is(err, workerpool.ErrClosed) {
 		t.Errorf("got %v; want %v", err, workerpool.ErrClosed)
 	}
@@ -324,12 +332,12 @@ func TestWorkerPoolDrainAfterClose(t *testing.T) {
 
 func TestWorkerPoolSubmitNil(t *testing.T) {
 	wp := workerpool.New(runtime.NumCPU())
-	defer wp.Close()
+	defer wp.Close(context.Background())
 	id := "nothing"
-	if err := wp.Submit(id, nil); err != nil {
+	if err := wp.Submit(context.Background(), id, nil); err != nil {
 		t.Fatalf("got %v; want no error", err)
 	}
-	tasks, err := wp.Drain()
+	tasks, err := wp.Drain(context.Background())
 	if err != nil {
 		t.Errorf("got %v; want no error", err)
 	}
@@ -348,8 +356,8 @@ func TestWorkerPoolSubmitNil(t *testing.T) {
 
 func TestWorkerPoolSubmitAfterClose(t *testing.T) {
 	wp := workerpool.New(runtime.NumCPU())
-	wp.Close()
-	if err := wp.Submit("dummy", nil); !errors.Is(err, workerpool.ErrClosed) {
+	wp.Close(context.Background())
+	if err := wp.Submit(context.Background(), "dummy", nil); !errors.Is(err, workerpool.ErrClosed) {
 		t.Fatalf("got %v; want %v", err, workerpool.ErrClosed)
 	}
 }
@@ -357,16 +365,16 @@ func TestWorkerPoolSubmitAfterClose(t *testing.T) {
 func TestWorkerPoolManyClose(t *testing.T) {
 	wp := workerpool.New(runtime.NumCPU())
 
-	// first call to Close() should not return an error.
-	if err := wp.Close(); err != nil {
-		t.Fatalf("unexpected error on Close(): %s", err)
+	// first call to.Close(context.Background()) should not return an error.
+	if err := wp.Close(context.Background()); err != nil {
+		t.Fatalf("unexpected error on.Close(context.Background()): %s", err)
 	}
 
-	// calling Close() more than once should always return an error.
-	if err := wp.Close(); !errors.Is(err, workerpool.ErrClosed) {
+	// calling.Close(context.Background()) more than once should always return an error.
+	if err := wp.Close(context.Background()); !errors.Is(err, workerpool.ErrClosed) {
 		t.Fatalf("got %v; want %v", err, workerpool.ErrClosed)
 	}
-	if err := wp.Close(); !errors.Is(err, workerpool.ErrClosed) {
+	if err := wp.Close(context.Background()); !errors.Is(err, workerpool.ErrClosed) {
 		t.Fatalf("got %v; want %v", err, workerpool.ErrClosed)
 	}
 }
@@ -381,7 +389,7 @@ func TestWorkerPoolClose(t *testing.T) {
 	wg.Add(n)
 	for i := 0; i < n; i++ {
 		id := fmt.Sprintf("task #%2d", i)
-		err := wp.Submit(id, func(ctx context.Context) error {
+		err := wp.Submit(context.Background(), id, func(ctx context.Context) error {
 			working <- struct{}{}
 			<-ctx.Done()
 			wg.Done()
@@ -397,8 +405,8 @@ func TestWorkerPoolClose(t *testing.T) {
 		<-working
 	}
 
-	if err := wp.Close(); err != nil {
-		t.Fatalf("unexpected error on Close(): %s", err)
+	if err := wp.Close(context.Background()); err != nil {
+		t.Fatalf("unexpected error on.Close(context.Background()): %s", err)
 	}
 	wg.Wait() // all routines should have returned
 }

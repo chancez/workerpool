@@ -36,11 +36,10 @@ var (
 // submitted tasks concurrently. The number of concurrent routines never
 // exceeds the specified limit.
 type WorkerPool struct {
-	workers chan struct{}
-	tasks   chan *task
-	cancel  context.CancelFunc
-	results []Task
-	wg      sync.WaitGroup
+	workerSemaphore chan struct{}
+	tasks           chan *task
+	results         []Task
+	wg              sync.WaitGroup
 
 	mu       sync.Mutex
 	draining bool
@@ -54,23 +53,20 @@ func New(n int) *WorkerPool {
 		panic(fmt.Sprintf("workerpool.New: n must be > 0, got %d", n))
 	}
 	wp := &WorkerPool{
-		workers: make(chan struct{}, n),
-		tasks:   make(chan *task),
+		workerSemaphore: make(chan struct{}, n),
+		tasks:           make(chan *task),
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	wp.cancel = cancel
-	go wp.run(ctx)
 	return wp
 }
 
 // Cap returns the concurrent workers capacity, see New().
 func (wp *WorkerPool) Cap() int {
-	return cap(wp.workers)
+	return cap(wp.workerSemaphore)
 }
 
 // Len returns the count of concurrent workers currently running.
 func (wp *WorkerPool) Len() int {
-	return len(wp.workers)
+	return len(wp.workerSemaphore)
 }
 
 // Submit submits f for processing by a worker. The given id is useful for
@@ -84,7 +80,7 @@ func (wp *WorkerPool) Len() int {
 // is not submitted for processing.
 // If the worker pool is closed, ErrClosed is returned and the task is not
 // submitted for processing.
-func (wp *WorkerPool) Submit(id string, f func(ctx context.Context) error) error {
+func (wp *WorkerPool) Submit(ctx context.Context, id string, f func(ctx context.Context) error) error {
 	wp.mu.Lock()
 	if wp.closed {
 		wp.mu.Unlock()
@@ -108,7 +104,7 @@ func (wp *WorkerPool) Submit(id string, f func(ctx context.Context) error) error
 // tasks that have been processed.
 // If a drain operation is already in progress, ErrDraining is returned.
 // If the worker pool is closed, ErrClosed is returned.
-func (wp *WorkerPool) Drain() ([]Task, error) {
+func (wp *WorkerPool) Drain(ctx context.Context) ([]Task, error) {
 	wp.mu.Lock()
 	if wp.closed {
 		wp.mu.Unlock()
@@ -121,7 +117,20 @@ func (wp *WorkerPool) Drain() ([]Task, error) {
 	wp.draining = true
 	wp.mu.Unlock()
 
-	wp.wg.Wait()
+	done := make(chan struct{})
+	go func() {
+		// TODO(chance): this go routine may leak if a task never returns
+		wp.wg.Wait()
+		close(done)
+	}()
+
+	// wait for context cancellation or for the go routine above to return,
+	// indicating all tasks are finished
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-done:
+	}
 
 	// NOTE: It's not necessary to hold a lock when reading or writing
 	// wp.results as no other routine is running at this point besides the
@@ -140,7 +149,7 @@ func (wp *WorkerPool) Drain() ([]Task, error) {
 // Close sends the cancellation signal to any running task and waits for all
 // workers, if any, to return.
 // Close will return ErrClosed if it has already been called.
-func (wp *WorkerPool) Close() error {
+func (wp *WorkerPool) Close(ctx context.Context) error {
 	wp.mu.Lock()
 	if wp.closed {
 		wp.mu.Unlock()
@@ -149,33 +158,55 @@ func (wp *WorkerPool) Close() error {
 	wp.closed = true
 	wp.mu.Unlock()
 
-	wp.cancel()
-	wp.wg.Wait()
-
-	// At this point, all routines have returned. This means that Submit is not
-	// pending to write to the task channel and it is thus safe to close it.
+	// Signal to Run that we should stop starting new tasks. This triggers Run()
+	// to cancel the task context of each task.
 	close(wp.tasks)
 
-	// wait for the "run" routine
-	<-wp.workers
-	return nil
+	done := make(chan struct{})
+	go func() {
+		// TODO(chance): this go routine may leak if a task never returns
+		wp.wg.Wait()
+		close(done)
+	}()
+
+	// wait for context cancellation or for the go routine above to return,
+	// indicating all tasks are finished
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-done:
+		return nil
+	}
 }
 
-// run loops over the tasks channel and starts processing routines. It should
-// only be called once during the lifetime of a WorkerPool.
-func (wp *WorkerPool) run(ctx context.Context) {
+// Run starts processing pending tasks.
+func (wp *WorkerPool) Run(ctx context.Context) error {
+	defer close(wp.workerSemaphore)
+
+	// If run returns, we should cancel the context for the running tasks
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	for t := range wp.tasks {
 		t := t
 		result := taskResult{id: t.id}
 		wp.results = append(wp.results, &result)
-		wp.workers <- struct{}{}
+
+		// check for context cancellation while trying to obtain the worker
+		// semaphore
+		select {
+		case wp.workerSemaphore <- struct{}{}:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+
 		go func() {
 			defer wp.wg.Done()
 			if t.run != nil {
 				result.err = t.run(ctx)
 			}
-			<-wp.workers
+			<-wp.workerSemaphore
 		}()
 	}
-	close(wp.workers)
+	return nil
 }
